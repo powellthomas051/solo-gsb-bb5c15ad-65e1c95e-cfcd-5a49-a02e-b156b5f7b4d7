@@ -5,4 +5,16 @@ services:
     container_name: guji-fragment-aligner
     ports:
       - "8000:8000"
+    environment:
+      # /api/align 同时允许运行或清理中的子进程数；无空位立即返回 503，不排队
+      ALIGN_MAX_PROCESSES: "2"
+      # /api/align 从接纳起的最长计算秒数；超时返回 504 并终止回收子进程
+      ALIGN_TIMEOUT_SECONDS: "10"
+    healthcheck:
+      # /health 只反映进程存活，不等待任何对齐计算
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     restart: unless-stopped

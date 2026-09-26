@@ -2,6 +2,10 @@
 
 - ``POST /api/align``：提交两段含 "?"（未辨认字）的转写文本，将左段后缀与
   右段前缀做最优对齐，返回最高分对齐的原文区间、逐列对齐和拼接文本。
+  计算在**独立子进程**中执行：受 ``ALIGN_MAX_PROCESSES`` 限制（默认 2，
+  满额立即 503、不排队），从接纳起 ``ALIGN_TIMEOUT_SECONDS``（默认 10 秒）
+  超时返回 504，超时或客户端断开会终止并回收对应子进程，子进程异常返回
+  500 且不影响后续接纳。
 - ``POST /api/assemble``：提交按阅读顺序排列的 2～5 段转写，逐段复用上述
   后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
 - ``POST /api/collate``：沿用 ``/api/assemble`` 的请求限制与续接门槛复用其
@@ -57,10 +61,20 @@
   及原区间逐字 sources，同长度多解返回 409 和两种操作，无解返回 422。
 """
 
-from fastapi import FastAPI, HTTPException
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .aligner import WILDCARD, align
+from .aligner import WILDCARD
+from .alignproc import (
+    AlignChildError,
+    AlignClientDisconnected,
+    AlignRunner,
+    AlignSlotUnavailable,
+    AlignTimeout,
+    load_config,
+)
 from .assembler import AssemblyError, assemble
 from .collator import collate
 from .comparator import EditionAssemblyError, compare_editions
@@ -121,6 +135,27 @@ MAX_SEGMENTS = 5     # /api/assemble 最大段数
 MIN_SEGMENTS = 2     # /api/assemble 最小段数
 MAX_TOTAL_LEN = 800  # /api/assemble 各段总长上限
 
+# 启动期加载并校验子进程执行层配置；非法正整数配置在此直接抛错，
+# uvicorn 导入本模块即失败、服务无法启动。
+ALIGN_CONFIG = load_config()
+
+# 进程级执行器单例：lifespan 负责关闭回收；同时保留模块级实例，
+# 以便未运行 lifespan 的测试客户端（TestClient 直接调用）也能工作。
+align_runner = AlignRunner(ALIGN_CONFIG)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 默认复用模块级执行器；测试可在进入 lifespan 前预先注入执行器。
+    runner = getattr(app.state, "align_runner", None) or align_runner
+    app.state.align_runner = runner
+    try:
+        yield
+    finally:
+        # 服务关闭：终止并回收全部在运 align 子进程，再交还状态
+        await runner.aclose()
+
+
 app = FastAPI(
     title="古籍残页转写拼接 API",
     description=(
@@ -129,6 +164,7 @@ app = FastAPI(
         "右段未参与对齐的后缀不计分。"
     ),
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -789,22 +825,74 @@ def index():
 
 
 @app.get("/health", summary="健康检查")
-def health():
+async def health():
+    # 不等待任何对齐计算：即使 align 子进程名额占满也立即返回
     return {"status": "ok"}
 
 
 @app.post(
     "/api/align",
     response_model=AlignResponse,
-    summary="拼接两段残页转写文本",
+    summary="拼接两段残页转写文本（独立子进程计算）",
     description=(
         "计分规则：相同字 +2；`?` 与任意字配对 0；异字 -2；"
         "连续空缺首字 -3、其余每字 -1。至少一对字符对齐。"
-        "同分取对齐字符对数最多者，再取左段起点最小者。"
+        "同分取对齐字符对数最多者，再取左段起点最小者。\n\n"
+        "每个被接纳请求在**独立子进程**中运行对齐，主进程异步等待：\n"
+        "- `ALIGN_MAX_PROCESSES`（默认 2）限制运行中或清理中的子进程数，"
+        "无空位立即返回 **503**，不排队；\n"
+        "- `ALIGN_TIMEOUT_SECONDS`（默认 10）从接纳起计时，超时返回 **504**，"
+        "并终止、回收对应子进程；\n"
+        "- 等待期间客户端断开同样终止、回收对应子进程；\n"
+        "- 子进程异常（非零退出等）返回 **500**，不影响后续请求接纳。"
     ),
+    responses={
+        503: {"description": "对齐子进程名额已满，请求未被接纳（不排队）"},
+        504: {"description": "从接纳起超过 ALIGN_TIMEOUT_SECONDS 仍未完成"},
+        500: {"description": "对齐子进程异常退出"},
+    },
 )
-def api_align(req: AlignRequest):
-    return align(req.left, req.right)
+async def api_align(req: AlignRequest, request: Request):
+    runner: AlignRunner = getattr(
+        request.app.state, "align_runner", None
+    ) or align_runner
+    try:
+        return await runner.run(
+            req.left, req.right, request.is_disconnected
+        )
+    except AlignSlotUnavailable as exc:
+        limit = exc.args[0] if exc.args else ALIGN_CONFIG.max_processes
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": (
+                    f"对齐计算子进程名额已满（上限 {limit}），"
+                    "请求不排队，请稍后重试"
+                ),
+                "max_processes": limit,
+            },
+        ) from exc
+    except AlignTimeout as exc:
+        timeout = exc.args[0] if exc.args else ALIGN_CONFIG.timeout_seconds
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "message": f"对齐计算在 {timeout} 秒内未完成，已终止并回收子进程",
+                "timeout_seconds": timeout,
+            },
+        ) from exc
+    except AlignClientDisconnected:
+        # 客户端已断开；子进程已终止回收。返回非标准 499 供访问日志识别，
+        # 响应本身通常已无法送达（连接已关闭）。
+        raise HTTPException(
+            status_code=499,
+            detail={"message": "客户端在对齐计算完成前断开，已终止并回收子进程"},
+        )
+    except AlignChildError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"对齐计算子进程异常：{exc}"},
+        ) from exc
 
 
 @app.post(
