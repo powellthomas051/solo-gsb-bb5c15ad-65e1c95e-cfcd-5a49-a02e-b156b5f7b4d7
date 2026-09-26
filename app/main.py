@@ -2,6 +2,10 @@
 
 - ``POST /api/align``：提交两段含 "?"（未辨认字）的转写文本，将左段后缀与
   右段前缀做最优对齐，返回最高分对齐的原文区间、逐列对齐和拼接文本。
+  计算执行层：每个已接纳请求在**独立子进程**中运行对齐，主进程异步等待；
+  运行或清理中的子进程数受 ``ALIGN_MAX_PROCESSES`` 限制（默认 2），无空位
+  立即返回 503（不排队）；计算从接纳起超过 ``ALIGN_TIMEOUT_SECONDS`` 秒
+  （默认 10）返回 504 并终止回收子进程；子进程异常返回 500。
 - ``POST /api/assemble``：提交按阅读顺序排列的 2～5 段转写，逐段复用上述
   后缀-前缀对齐拼接，并返回最终文本与逐字来源列表。
 - ``POST /api/collate``：沿用 ``/api/assemble`` 的请求限制与续接门槛复用其
@@ -57,10 +61,21 @@
   及原区间逐字 sources，同长度多解返回 409 和两种操作，无解返回 422。
 """
 
-from fastapi import FastAPI, HTTPException
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .aligner import WILDCARD, align
+from .align_executor import (
+    ALIGN_MAX_PROCESSES,
+    ALIGN_TIMEOUT_SECONDS,
+    AlignBusyError,
+    AlignExecutor,
+    AlignTimeoutError,
+    AlignWorkerError,
+)
+from .aligner import WILDCARD
 from .assembler import AssemblyError, assemble
 from .collator import collate
 from .comparator import EditionAssemblyError, compare_editions
@@ -121,6 +136,21 @@ MAX_SEGMENTS = 5     # /api/assemble 最大段数
 MIN_SEGMENTS = 2     # /api/assemble 最小段数
 MAX_TOTAL_LEN = 800  # /api/assemble 各段总长上限
 
+# /api/align 的子进程执行器：并发名额与时限来自环境变量（非法值在导入
+# app.align_executor 时已抛出，服务无法启动）
+align_executor = AlignExecutor(
+    max_processes=ALIGN_MAX_PROCESSES,
+    timeout_seconds=ALIGN_TIMEOUT_SECONDS,
+)
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    yield
+    # 服务关闭：终止并回收全部残留对齐子进程，不泄漏
+    await align_executor.aclose()
+
+
 app = FastAPI(
     title="古籍残页转写拼接 API",
     description=(
@@ -129,6 +159,7 @@ app = FastAPI(
         "右段未参与对齐的后缀不计分。"
     ),
     version="1.0.0",
+    lifespan=_lifespan,
 )
 
 
@@ -793,6 +824,14 @@ def health():
     return {"status": "ok"}
 
 
+async def _wait_client_disconnect(request: Request) -> None:
+    """挂起直到客户端断开连接；连接正常时一直等待。"""
+    while True:
+        message = await request.receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
 @app.post(
     "/api/align",
     response_model=AlignResponse,
@@ -800,11 +839,47 @@ def health():
     description=(
         "计分规则：相同字 +2；`?` 与任意字配对 0；异字 -2；"
         "连续空缺首字 -3、其余每字 -1。至少一对字符对齐。"
-        "同分取对齐字符对数最多者，再取左段起点最小者。"
+        "同分取对齐字符对数最多者，再取左段起点最小者。\n\n"
+        "计算执行层：每个已接纳请求在独立子进程中运行对齐计算，主进程异步等待"
+        "（`/health` 等接口不被计算阻塞）。运行或清理中的子进程数达到 "
+        "`ALIGN_MAX_PROCESSES`（默认 2）时新请求立即返回 **503**（不排队）；"
+        "计算从接纳起超过 `ALIGN_TIMEOUT_SECONDS` 秒（默认 10）返回 **504**，"
+        "并终止、回收对应子进程后才释放名额；子进程异常退出返回 **500**，"
+        "后续请求可正常接纳。"
     ),
+    responses={
+        500: {"description": "对齐子进程异常退出或输出无法解析"},
+        503: {"description": "对齐子进程名额已满，请求未被接纳（不排队）"},
+        504: {"description": "对齐计算超时，子进程已终止并回收"},
+    },
 )
-def api_align(req: AlignRequest):
-    return align(req.left, req.right)
+async def api_align(req: AlignRequest, request: Request):
+    compute = asyncio.ensure_future(align_executor.run(req.left, req.right))
+    disconnect = asyncio.ensure_future(_wait_client_disconnect(request))
+    try:
+        done, _pending = await asyncio.wait(
+            {compute, disconnect}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if compute not in done:
+            # 客户端断开：取消计算，executor 终止并回收子进程后才返回
+            raise HTTPException(
+                status_code=499,
+                detail="客户端已断开连接，对齐子进程已终止并回收",
+            )
+        try:
+            return compute.result()
+        except AlignBusyError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except AlignTimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except AlignWorkerError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        # 等待计算任务收尾（含子进程终止回收）与断开监听退出，不泄漏任务
+        disconnect.cancel()
+        if not compute.done():
+            compute.cancel()
+        await asyncio.gather(compute, disconnect, return_exceptions=True)
 
 
 @app.post(

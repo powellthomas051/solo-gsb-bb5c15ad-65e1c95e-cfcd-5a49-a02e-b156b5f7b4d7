@@ -5,4 +5,9 @@ services:
     container_name: guji-fragment-aligner
     ports:
       - "8000:8000"
+    environment:
+      # 同时处于运行或清理中的对齐子进程数上限（默认 2，须为正整数）
+      ALIGN_MAX_PROCESSES: ${ALIGN_MAX_PROCESSES:-2}
+      # 单次对齐计算从接纳起的最长秒数（默认 10，须为正整数）
+      ALIGN_TIMEOUT_SECONDS: ${ALIGN_TIMEOUT_SECONDS:-10}
     restart: unless-stopped
