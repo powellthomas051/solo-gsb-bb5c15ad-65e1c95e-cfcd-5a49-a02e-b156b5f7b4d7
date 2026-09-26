@@ -1,0 +1,8 @@
+services:
+  api:
+    build: .
+    image: guji-fragment-aligner:latest
+    container_name: guji-fragment-aligner
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
